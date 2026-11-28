@@ -2317,6 +2317,11 @@ fn behavior_folds(
     Ok(())
 }
 
+fn is_spacing_row(block: &BufferBlock) -> bool {
+    !block.id.0.starts_with("plan:walkthrough:")
+        && block.text.rows().all(|row| row.trim().is_empty())
+}
+
 fn filtered_blocks(
     mut block: Vec<BufferBlock>,
     hidden: &HashSet<BlockId>,
@@ -2431,11 +2436,7 @@ fn filtered_blocks(
         if !retained[position] {
             continue;
         }
-        let empty = item
-            .text
-            .wire_rows()
-            .iter()
-            .all(|row| row.trim().is_empty());
+        let empty = is_spacing_row(item);
         // An empty declaration row cannot replace the unhighlighted section spacer.
         let section_separator =
             item.id.0.starts_with("plan:section:") && item.id.0.ends_with(":separator");
@@ -2453,13 +2454,7 @@ fn filtered_blocks(
         if !retained[position] {
             continue;
         }
-        if item
-            .text
-            .wire_rows()
-            .iter()
-            .all(|row| row.trim().is_empty())
-            && !item.id.0.ends_with(":hunk:deferred")
-        {
+        if is_spacing_row(item) && !item.id.0.ends_with(":hunk:deferred") {
             retained[position] = false;
         } else {
             break;
@@ -2620,6 +2615,40 @@ fn pointer(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spacing_cleanup_keeps_blank_walkthrough_anchors() -> anyhow::Result<()> {
+        let row = |id: &str, text: &str| -> anyhow::Result<_> {
+            Ok(super::BufferBlock {
+                id: super::BlockId(id.into()),
+                text: super::BufferText::from_rows([text])?,
+                metadata: Default::default(),
+            })
+        };
+        let blocks = vec![
+            row("declaration", "fn open();")?,
+            row("spacer:1", "")?,
+            row("spacer:2", "")?,
+            super::walkthrough_anchor(0)?,
+            row("spacer:3", "")?,
+            super::walkthrough_anchor(1)?,
+            row("spacer:4", "")?,
+        ];
+        let kept = super::filtered_blocks(blocks, &super::HashSet::new(), true, false)?;
+        assert_eq!(
+            kept.iter()
+                .map(|block| block.id.0.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "declaration",
+                "spacer:1",
+                "plan:walkthrough:1",
+                "spacer:3",
+                "plan:walkthrough:2"
+            ]
+        );
+        Ok(())
+    }
+
     use super::{FileChange, test_file_change};
     use crate::plan::DesignTestChange;
     use crate::plan::design_tests::DesignTestCase;
